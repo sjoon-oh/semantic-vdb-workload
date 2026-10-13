@@ -317,5 +317,5 @@ def test_a_build_with_several_overlaps_leaves_nothing_but_the_family(dataset):
     # shared/ is the one staging directory that stays: it holds what a later run reuses.
     assert (family / "shared" / "cache.json").is_file()
     assert sorted(path.name for path in (family / "shared").iterdir()) == [
-        "cache.json", "common", "eval_step0", "mix_info", "mixes", "n2",
+        "cache.json", "common", "eval_step0", "mix_info", "mixes", "n2", "stream_lists",
     ]

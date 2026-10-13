@@ -68,7 +68,8 @@ def build_scenario(name, tmp_path, workers=1):
             checkpoint_every=p["checkpoint_every"], eval_k=p["eval_k"],
         ),
         groundtruth=config.GroundTruthConfig(
-            stream_k=p["stream_k"], device="cpu", base_batch_rows=97, query_chunk_rows=13
+            stream_k=p["stream_k"], device="cpu", base_batch_rows=97, query_chunk_rows=13,
+            stream_groundtruth=True,
         ),
         parallel=cpu_parallel(workers),
     )

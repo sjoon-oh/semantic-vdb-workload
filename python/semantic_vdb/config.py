@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -29,6 +30,9 @@ DEVICES = ("gpu", "cpu")
 # What to do when the family directory of this name already exists: refuse (the default) or
 # add only the pools that are missing (see extend.py).
 EXISTING_POLICIES = ("error", "extend")
+# Neighbours stored per stream query unless [groundtruth] stream_k says otherwise: deeper than
+# the default evaluation k (100) so that recall@100 can be scored with some tolerance.
+DEFAULT_STREAM_K = 120
 
 
 class ConfigError(ValueError):
@@ -147,9 +151,17 @@ class GroundTruthConfig:
     # None means "auto": chosen from the free memory of the selected GPU at run time.
     base_batch_rows: Optional[int]
     query_chunk_rows: Optional[int]
-    # False: the stream queries (the requests of the Zipf / uniform_unique streams) get no
-    # ground truth at all; only the evaluation queries are scored at their checkpoints.
-    stream_groundtruth: bool = True
+    # True: after the workload is built, a follow-up stage computes the exact answers of the
+    # stream queries (the requests of the Zipf / uniform_unique streams); sets that already
+    # have them are skipped (see stream_gt.py). False (the default, because the stage can take
+    # a long time on large data): the stream queries get no ground truth, only the evaluation
+    # queries are scored at their checkpoints.
+    stream_groundtruth: bool = False
+    # Pools that get stream answers: ("all",) or pool names / glob patterns (o50/g200, o80/*).
+    # A chosen pool gets all its streams and all its update percentages.
+    stream_pools: Tuple[str, ...] = ("all",)
+    # Seconds between the progress lines of the follow-up stage.
+    progress_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -503,6 +515,43 @@ def _load_evaluation(parser) -> EvaluationConfig:
     )
 
 
+def _pool_patterns(parser) -> Tuple[str, ...]:
+    """``[groundtruth] stream_pools``: ``all`` or a comma-separated list of names / globs."""
+    text = _raw(parser, "groundtruth", "stream_pools", "all")
+    names = tuple(item.strip() for item in text.split(",") if item.strip())
+    if not names:
+        raise ConfigError("[groundtruth] stream_pools must be all or a list of pool names")
+    if "all" in names and len(names) > 1:
+        raise ConfigError("[groundtruth] stream_pools: all cannot be combined with pool names")
+    for name in names:
+        if name.startswith("/") or ".." in name or " " in name:
+            raise ConfigError(f"[groundtruth] stream_pools: {name!r} is not a pool name")
+    return names
+
+
+def _check_stream_k(workload_config) -> None:
+    """The stored neighbours must reach at least as deep as the recall that is scored.
+
+    Only relevant when the follow-up stage will run. ``stream_k`` equal to ``eval_k`` works
+    but leaves no room for a tolerant comparison, so it is only a warning.
+    """
+    gt, eval_k = workload_config.groundtruth, workload_config.evaluation.eval_k
+    if not gt.stream_groundtruth:
+        return
+    if gt.stream_k < eval_k:
+        raise ConfigError(
+            f"[groundtruth] stream_k ({gt.stream_k}) must not be smaller than [evaluation] "
+            f"eval_k ({eval_k}); set it larger than the k at which recall is scored"
+        )
+    if gt.stream_k == eval_k:
+        warnings.warn(
+            f"[groundtruth] stream_k equals eval_k ({eval_k}); a larger value leaves room "
+            "for answers that are slightly out of the top-k",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 def _batch_rows(parser, key: str) -> Optional[int]:
     """A GT batch size: ``auto`` (the default, returned as None) or an integer >= 1."""
     value = _auto_or_integer(parser, "groundtruth", key, "auto", minimum=1)
@@ -560,15 +609,20 @@ def load_workload_config(path: str | os.PathLike) -> WorkloadConfig:
         updates=_load_updates(parser),
         evaluation=evaluation,
         groundtruth=GroundTruthConfig(
-            stream_k=_integer(parser, "groundtruth", "stream_k", default=10, minimum=1),
+            stream_k=_integer(parser, "groundtruth", "stream_k", default=DEFAULT_STREAM_K, minimum=1),
             device=_choice(parser, "groundtruth", "device", DEVICES, default="gpu"),
             base_batch_rows=_batch_rows(parser, "base_batch_rows"),
             query_chunk_rows=_batch_rows(parser, "query_chunk_rows"),
-            stream_groundtruth=_boolean(parser, "groundtruth", "stream_groundtruth", True),
+            stream_groundtruth=_boolean(parser, "groundtruth", "stream_groundtruth", False),
+            stream_pools=_pool_patterns(parser),
+            progress_seconds=_integer(
+                parser, "groundtruth", "progress_seconds", default=60, minimum=1
+            ),
         ),
         parallel=_load_parallel(parser),
         existing=_choice(parser, "workload", "existing", EXISTING_POLICIES, default="error"),
     )
     # Fail now, before any data file is opened, if a percentage cannot be delivered exactly.
     workload_config.request_mixes()
+    _check_stream_k(workload_config)
     return workload_config

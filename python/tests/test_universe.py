@@ -234,63 +234,6 @@ def test_split_ranges_cover_everything_without_overlap():
 
 
 # ---------------------------------------------------------------------------
-# which vectors need a list, and borrowing lists from a larger pool
-# ---------------------------------------------------------------------------
-
-
-def make_pools(groups=5, big=8, small=3, dim=4, seed=0):
-    rng = np.random.default_rng(seed)
-    reference = rng.integers(0, 255, size=(groups * big, dim)).astype(np.uint8)
-    # The small pool takes the first `small` members of every group of the reference.
-    prefix = reference.reshape(groups, big, dim)[:, :small, :].reshape(-1, dim).copy()
-    return reference, prefix
-
-
-def test_matching_rows_flags_exactly_the_equal_rows():
-    reference, prefix = make_pools()
-    assert universe.matching_rows(prefix, reference, 5, 3, 8).all()
-    changed = prefix.copy()
-    changed[7, 0] ^= 1  # one byte of row 7 differs
-    equal = universe.matching_rows(changed, reference, 5, 3, 8, groups_per_step=2)
-    assert not equal[7] and equal.sum() == len(prefix) - 1
-
-
-def test_a_smaller_pool_shares_the_lists_of_the_larger_one():
-    reference, prefix = make_pools()
-    big = universe.PoolRequests(reference, np.array([0, 9, 10, 39]), layout=(5, 8))
-    small = universe.PoolRequests(prefix, np.array([0, 4, 5, 14]), layout=(5, 3))
-    requests = universe.plan_list_requests([small, big])  # the order must not matter
-
-    assert requests.shared_rows == [4, 4] and requests.own_rows == [0, 0]
-    # Every requested row finds its own vector in the list vectors.
-    for pool, index in zip((small, big), requests.list_index):
-        for row in pool.requested_rows:
-            assert np.array_equal(requests.vectors[index[row]], pool.vectors[row])
-        assert (np.delete(index, pool.requested_rows) == -1).all()
-    # Rows 0 of both pools are the same vector and share one list.
-    assert requests.list_index[0][0] == requests.list_index[1][0]
-    assert len(requests.vectors) < 8  # 8 requested rows, fewer lists
-
-
-def test_a_row_that_differs_gets_a_list_of_its_own():
-    reference, prefix = make_pools()
-    prefix[4, 1] ^= 1  # row 4 of the small pool is no longer the reference vector
-    big = universe.PoolRequests(reference, np.array([0, 8]), layout=(5, 8))
-    small = universe.PoolRequests(prefix, np.array([0, 4]), layout=(5, 3))
-    requests = universe.plan_list_requests([big, small])
-    assert requests.shared_rows == [2, 1] and requests.own_rows == [0, 1]
-    assert np.array_equal(requests.vectors[requests.list_index[1][4]], prefix[4])
-
-
-def test_pools_without_a_layout_never_share():
-    rng = np.random.default_rng(1)
-    pool = universe.PoolRequests(rng.integers(0, 9, size=(10, 3)).astype(np.uint8), np.array([2, 5]))
-    requests = universe.plan_list_requests([pool])
-    assert requests.own_rows == [2] and requests.shared_rows == [0]
-    assert np.array_equal(requests.vectors, pool.vectors[[2, 5]])
-
-
-# ---------------------------------------------------------------------------
 # on a real GPU (skipped when no free GPU is available)
 # ---------------------------------------------------------------------------
 

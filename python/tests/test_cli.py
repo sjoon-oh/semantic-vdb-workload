@@ -130,7 +130,8 @@ update_percents = 0, 50
 checkpoint_every = 2
 eval_k = 5
 [groundtruth]
-stream_k = 3
+stream_groundtruth = true
+stream_k = 6
 device = cpu
 """,
         encoding="utf-8",
@@ -145,7 +146,8 @@ device = cpu
     assert family_path == tmp_path / "out" / "b" / "workloads" / "w"
     # One pool (group size 4), two sets inside it, and the index files of the family.
     assert sorted(path.name for path in family_path.iterdir()) == [
-        "build_report.json", "family.json", "o70", "shared",
+        "build_report.json", "build_report_stream_groundtruth_1.json", "family.json", "o70",
+        "shared",
     ]
     # Overlap level o70 (target_overlap 0.7), group size 4, then the two update sets.
     assert sorted(path.name for path in (family_path / "o70").iterdir()) == ["g4"]
@@ -215,7 +217,8 @@ update_percents = 0, 50
 checkpoint_every = 2
 eval_k = 5
 [groundtruth]
-stream_k = 3
+stream_groundtruth = true
+stream_k = 6
 device = cpu
 """
 

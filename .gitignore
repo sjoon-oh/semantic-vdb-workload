@@ -66,3 +66,13 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Generated workload data (vectors, ids, ground truth) must stay out of the repository
+*.bin
+*.u8bin
+*.i8bin
+*.fbin
+*.f16bin
+*.ibin
+
+__pycache__/

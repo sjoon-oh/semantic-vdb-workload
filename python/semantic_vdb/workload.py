@@ -98,18 +98,14 @@ from semantic_vdb.stream import (
     repeat_diagnostics,
     step_boundaries,
 )
-from semantic_vdb.universe import (
-    ActiveSetScanner,
-    PoolRequests,
-    UniverseLists,
-    choose_list_length,
-    plan_list_requests,
-    scan_lists,
-    select_alive_prefix,
-)
+from semantic_vdb.universe import AnswerSource, UniverseLists, choose_list_length, scan_lists
 from semantic_vdb.updates import RequestMix, UpdateSchedule, draw_deletions, make_schedule
 
 FORMAT_VERSION = FAMILY_FORMAT_VERSION
+# [groundtruth] settings that only steer the follow-up stage that answers the stream queries
+# (stream_gt.py). They are neither part of what a build produces nor of what a family has in
+# common, so they are left out of fingerprints and of the configuration a set records.
+STREAM_STAGE_SETTINGS = ("stream_groundtruth", "stream_k", "stream_pools", "progress_seconds")
 # Directory name of the duplicate-free uniform stream, and the second entry of its random
 # seed sequence (Zipf streams use their position in the exponent list, 0, 1, 2, ...), so
 # adding an exponent never changes the uniform stream.
@@ -137,10 +133,13 @@ def _no_log(message: str) -> None:
 def _fingerprint(config: WorkloadConfig, base_set: BaseSet) -> dict:
     """What an unfinished build must have in common with a build that continues it.
 
-    The machine resources ([parallel]) are left out: the files do not depend on them.
+    The machine resources ([parallel]) are left out: the files do not depend on them. So are
+    the settings of the stream ground truth stage, which runs after the build.
     """
     description = dataclasses.asdict(config)
     description.pop("parallel", None)
+    for key in STREAM_STAGE_SETTINGS:
+        description["groundtruth"].pop(key, None)
     return {
         "format_version": FORMAT_VERSION,
         "tool_version": __version__,
@@ -220,7 +219,9 @@ def build_workload(config: WorkloadConfig, log: Log = _no_log) -> Path:
         # Imported here because extend.py builds on this module.
         from semantic_vdb.extend import extend_family
 
-        return extend_family(config, base_set, final_dir, log)
+        family_dir = extend_family(config, base_set, final_dir, log)
+        _answer_stream_queries(config, base_set, family_dir, log)
+        return family_dir
 
     work_dir = final_dir.with_name(config.name + ".building")
     resume = _open_work_dir(work_dir, _fingerprint(config, base_set), log)
@@ -235,7 +236,22 @@ def build_workload(config: WorkloadConfig, log: Log = _no_log) -> Path:
     except BaseException:
         _keep_or_remove(work_dir, resume, log)
         raise
+    # The family is complete now. Answering the stream queries is a separate stage whose
+    # failure leaves a usable family behind; running the same command again continues it.
+    _answer_stream_queries(config, base_set, final_dir, log)
     return final_dir
+
+
+def _answer_stream_queries(
+    config: WorkloadConfig, base_set: BaseSet, family_dir: Path, log: Log
+) -> None:
+    """Run the follow-up stage of ``[groundtruth] stream_groundtruth = true`` (``stream_gt.py``)."""
+    if not config.groundtruth.stream_groundtruth:
+        return
+    # Imported here because stream_gt.py builds on this module.
+    from semantic_vdb.stream_gt import run_stream_groundtruth
+
+    run_stream_groundtruth(config, base_set, family_dir, log)
 
 
 # ---------------------------------------------------------------------------
@@ -361,12 +377,6 @@ class PoolData:
     group_sizes: np.ndarray  # (num_groups,)
     statistics: dict
     master_streams: Dict[str, Stream]  # drawn at the longest read count
-    list_index: Optional[np.ndarray] = None  # pool row -> row in the stream lists (-1 = none)
-    shared_rows: int = 0  # requested rows served by the reference pool's lists
-    own_rows: int = 0  # requested rows that needed a list of their own
-
-    def requested_rows(self) -> np.ndarray:
-        return np.unique(np.concatenate([s.pool_index for s in self.master_streams.values()]))
 
 
 def _master_streams(
@@ -473,7 +483,6 @@ def _estimate_host_bytes(
     base_set: BaseSet,
     specs: List[PoolSpec],
     longest_reads: int,
-    stream_list_length: int,
     eval_list_length: int,
     num_eval: int,
     num_seeds: int,
@@ -484,8 +493,7 @@ def _estimate_host_bytes(
     # The pool is also copied once when it is loaded back from its scratch file.
     pool_bytes = 2 * sum(spec.size * base_set.dim * item for spec in specs)
     stream_bytes = len(specs) * streams * longest_reads * BYTES_PER_STREAM_REQUEST
-    distinct = min(max(spec.size for spec in specs), longest_reads * streams * len(specs))
-    list_bytes = distinct * stream_list_length * 8 + num_eval * eval_list_length * 8
+    list_bytes = num_eval * eval_list_length * 8
     basis_bytes = num_seeds * config.groups.axes * base_set.dim * 8
     return pool_bytes + stream_bytes + list_bytes + basis_bytes
 
@@ -503,10 +511,8 @@ class _BuildContext:
     mixes: List[RequestMix]
     schedules: Dict[str, UpdateSchedule]
     universe_inserts: int
-    stream_lists: Optional[UniverseLists]  # None when [groundtruth] stream_groundtruth = false
     eval_lists: Optional[UniverseLists]  # None when an existing family supplies the answers
     eval_list_length: int  # length of the evaluation lists (also when an existing family has them)
-    distinct_queries: Optional[int]  # distinct stream query vectors with a list (None: no lists)
     base_path: Path
     insert_path: Optional[Path]
     work_dir: Path
@@ -549,13 +555,11 @@ class _Plan:
     longest_reads: int
     universe_inserts: int
     universe_size: int
-    stream_list_length: int
     eval_list_length: int
 
 
 def _plan_family(config: WorkloadConfig, base_set: BaseSet) -> _Plan:
     """Validate everything that can fail without reading vector data, and size the build."""
-    gt = config.groundtruth
     mixes, schedules = _plan_schedules(config, base_set)
     source: SeedSource = load_seed_source(config, base_set)
     eval_queries = load_eval_queries(config, source, base_set)
@@ -563,12 +567,9 @@ def _plan_family(config: WorkloadConfig, base_set: BaseSet) -> _Plan:
     specs = _pool_specs(config, source)
     longest_reads = max(mix.reads for mix in mixes)
     _check_unique_stream_fits(config, specs, longest_reads)
-    most_neighbours = config.evaluation.eval_k
-    if gt.stream_groundtruth:
-        most_neighbours = max(gt.stream_k, most_neighbours)
-    if base_set.num_base < most_neighbours:
+    if base_set.num_base < config.evaluation.eval_k:
         raise WorkloadError(
-            f"the base has {base_set.num_base} vectors, fewer than the {most_neighbours} "
+            f"the base has {base_set.num_base} vectors, fewer than the {config.evaluation.eval_k} "
             "neighbours the ground truth stores"
         )
 
@@ -577,57 +578,11 @@ def _plan_family(config: WorkloadConfig, base_set: BaseSet) -> _Plan:
     universe_inserts = max(schedule.total_inserts for schedule in schedules.values())
     universe_size = base_set.num_base + universe_inserts
     alive_fraction = base_set.num_base / universe_size
-    # Without stream ground truth no stream list is made (length 0 also keeps the memory
-    # estimate below free of it).
-    stream_list_length = (
-        choose_list_length(gt.stream_k, alive_fraction, universe_size)
-        if gt.stream_groundtruth
-        else 0
-    )
     eval_list_length = choose_list_length(config.evaluation.eval_k, alive_fraction, universe_size)
     return _Plan(
         mixes, schedules, source, eval_queries, inputs, specs, longest_reads, universe_inserts,
-        universe_size, stream_list_length, eval_list_length,
+        universe_size, eval_list_length,
     )
-
-
-def _plan_stream_lists(pools: List[PoolData]):
-    """Which distinct vectors need a stream list, and where every pool row finds its list.
-
-    Pools that share an overlap level are planned together (the largest of them is the
-    reference whose lists the smaller ones borrow, ``plan_list_requests``). Pools of another
-    overlap level have other noise, so they are planned on their own and their lists follow
-    behind. Returns the vectors to scan; sets ``list_index`` and the counters of every pool.
-    """
-    groups: Dict[Optional[str], List[PoolData]] = {}
-    for pool in pools:
-        groups.setdefault(pool.spec.overlap_name, []).append(pool)
-
-    vectors_parts: List[np.ndarray] = []
-    offset = 0  # lists of the earlier groups; this group's list rows start behind them
-    for members in groups.values():
-        requests = plan_list_requests(
-            [
-                PoolRequests(
-                    pool.vectors,
-                    pool.requested_rows(),
-                    # (groups, group size): N2 pools can lend their lists to smaller N2 pools
-                    (pool.spec.num_groups, pool.spec.group_size)
-                    if pool.spec.kind == "n2"
-                    else None,
-                )
-                for pool in members
-            ]
-        )
-        for pool, index, shared_rows, own_rows in zip(
-            members, requests.list_index, requests.shared_rows, requests.own_rows
-        ):
-            # -1 means "this row has no list" and must stay -1 after the shift.
-            pool.list_index = np.where(index >= 0, index + offset, -1)
-            pool.shared_rows, pool.own_rows = shared_rows, own_rows
-        vectors_parts.append(requests.vectors)
-        offset += len(requests.vectors)
-    return np.concatenate(vectors_parts, axis=0)
 
 
 def _build_family(
@@ -664,8 +619,8 @@ def _build_family(
             ) from error
         mixes, schedules, source = planned.mixes, planned.schedules, planned.source
         eval_queries, longest_reads = planned.eval_queries, planned.longest_reads
-        universe_inserts, universe_size = planned.universe_inserts, planned.universe_size
-        stream_list_length, eval_list_length = planned.stream_list_length, planned.eval_list_length
+        universe_inserts = planned.universe_inserts
+        eval_list_length = planned.eval_list_length
         # A run that extends a family builds only the pools that family does not have.
         specs = planned.specs
         if existing is not None:
@@ -681,7 +636,7 @@ def _build_family(
         num_seeds = 0 if source.seed_vectors is None else len(source.seed_vectors)
         check_host_memory(
             _estimate_host_bytes(
-                config, base_set, specs, longest_reads, stream_list_length, eval_list_length,
+                config, base_set, specs, longest_reads, eval_list_length,
                 len(eval_queries), num_seeds,
             )
         )
@@ -709,28 +664,13 @@ def _build_family(
         for pool in pools:
             log(f"[pool {pool.spec.name}] {len(pool.vectors)} vectors in {len(pool.group_sizes)} groups")
 
-    # ---- universe lists: one scan for everything that is requested anywhere ---------------
+    # ---- universe lists of the evaluation queries -------------------------------------------
+    # The stream queries get their lists in a follow-up stage (stream_gt.py).
     with timer("universe_lists"):
         base_path = base_set.directory / f"base{base_set.suffix}"
         insert_path = (
             base_set.directory / f"insert_pool{base_set.suffix}" if universe_inserts > 0 else None
         )
-        stream_lists: Optional[UniverseLists] = None
-        distinct_queries: Optional[int] = None
-        if gt.stream_groundtruth:
-            stream_vectors = _plan_stream_lists(pools)
-            log(
-                f"[universe] {len(stream_vectors)} distinct query vectors, lists of "
-                f"{stream_list_length} over {universe_size} vectors "
-                f"({base_set.num_base} base + {universe_inserts} inserted)"
-            )
-            stream_lists = scan_lists(
-                stream_vectors, stream_list_length, base_path, insert_path, universe_inserts,
-                base_set.metric, plan, universe_dir, "stream", resume=resume,
-            )
-            distinct_queries = int(len(stream_vectors))
-        else:
-            log("[universe] stream ground truth is off: only the evaluation queries are scanned")
         eval_lists: Optional[UniverseLists] = None
         if existing is None:
             eval_lists = scan_lists(
@@ -745,7 +685,7 @@ def _build_family(
     with timer("sets"):
         context = _BuildContext(
             config, base_set, source, eval_queries, plan, pools, mixes, schedules,
-            universe_inserts, stream_lists, eval_lists, eval_list_length, distinct_queries,
+            universe_inserts, eval_lists, eval_list_length,
             base_path, insert_path, work_dir, shared_dir, store, existing, log, resume,
         )
         records = _build_sets(context)
@@ -769,55 +709,8 @@ def _build_family(
             # Stages that an interrupted earlier run had finished (empty for an uninterrupted
             # build); their time is not in stage_seconds.
             "resumed_from_stages": finished_before,
-            "stream_requests_answered_by_scan": sum(r.stream_fallbacks for r in records),
         },
     )
-
-
-# ---------------------------------------------------------------------------
-# answers from the lists
-# ---------------------------------------------------------------------------
-
-
-class _AnswerSource:
-    """Turns universe lists into ground truth, with the scan of the active set as fallback."""
-
-    def __init__(self, context: _BuildContext) -> None:
-        self._context = context
-        self._scanner = ActiveSetScanner(
-            context.base_path, context.insert_path, context.base_set.metric, context.plan
-        )
-
-    def close(self) -> None:
-        self._scanner.close()
-
-    def answer(
-        self,
-        list_ids: np.ndarray,
-        list_dists: np.ndarray,
-        query_vectors: Callable[[np.ndarray], np.ndarray],
-        k: int,
-        inserted: int,
-        deleted_mask: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, int]:
-        """Answers for the given list rows, and how many of them needed the fallback.
-
-        ``query_vectors(rows)`` yields the vectors of the rows that must be scanned because
-        their list had fewer than k live entries.
-        """
-        alive_limit = self._context.base_set.num_base + inserted
-        ids, dists, enough = select_alive_prefix(list_ids, list_dists, alive_limit, deleted_mask, k)
-        missing = np.flatnonzero(~enough)
-        if len(missing) > 0:
-            # Requests of the same step that repeat a vector are scanned only once.
-            unique_vectors, inverse = np.unique(
-                query_vectors(missing), axis=0, return_inverse=True
-            )
-            result = self._scanner.top(unique_vectors, k, inserted, deleted_mask)
-            inverse = inverse.reshape(-1)
-            ids[missing] = result.neighbour_ids[inverse]
-            dists[missing] = result.neighbour_dists[inverse]
-        return ids, dists, int(len(missing))
 
 
 # ---------------------------------------------------------------------------
@@ -831,8 +724,7 @@ class _SetRecord:
     mix: RequestMix
     directory: Path
     manifest_sha256: str = ""
-    stream_fallbacks: int = 0  # requests of this set answered by scanning the active set
-    eval_fallbacks: int = 0  # the same for the evaluation queries (shared by the pools)
+    eval_fallbacks: int = 0  # evaluation requests answered by scanning the active set
 
 
 def _write_common_files(context: _BuildContext) -> None:
@@ -859,7 +751,7 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
     config, base_set, plan = context.config, context.base_set, context.plan
     suffix = base_set.suffix
     num_steps = config.stream.num_steps
-    stream_k, eval_k = config.groundtruth.stream_k, config.evaluation.eval_k
+    eval_k = config.evaluation.eval_k
     num_base = base_set.num_base
 
     store, link_store = context.store, context.link_store
@@ -872,15 +764,13 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
         _write_common_files(context)
         if resume is not None:
             resume.mark("common")
-    answers = _AnswerSource(context)
+    answers = AnswerSource(
+        context.base_path, context.insert_path, base_set.num_base, base_set.metric, plan
+    )
     writer = BoundedWriter(plan.cpu_workers)
     records: List[_SetRecord] = []
 
-    # The stream lists are gathered row by row; the evaluation lists are used whole at every
-    # checkpoint, so they are loaded once.
-    with_stream_gt = context.stream_lists is not None
-    stream_ids = context.stream_lists.ids if with_stream_gt else None
-    stream_dists = context.stream_lists.dists if with_stream_gt else None
+    # The evaluation lists are used whole at every checkpoint, so they are loaded once.
     if computing_shared:
         eval_ids = np.array(context.eval_lists.ids)
         eval_dists = np.array(context.eval_lists.dists)
@@ -946,7 +836,6 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
                 p.spec.name: {name: master.head(mix.reads) for name, master in p.master_streams.items()}
                 for p in context.pools
             }
-            stream_fallbacks = {p.spec.name: 0 for p in context.pools}
             eval_fallbacks = step0_fallbacks
 
             deleted_mask = np.zeros(num_base + context.universe_inserts, dtype=bool)
@@ -958,27 +847,10 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
                 first, last = boundaries[step - 1], boundaries[step]
 
                 for pool in context.pools:
-                    name_of_pool = pool.spec.name
-                    set_dir = set_dirs[name_of_pool]
-                    names = list(streams[name_of_pool])
-                    if with_stream_gt:
-                        # All streams of the step are answered together.
-                        rows = np.concatenate(
-                            [streams[name_of_pool][name].pool_index[first:last] for name in names]
-                        )
-                        list_rows = pool.list_index[rows]
-                        if (list_rows < 0).any():
-                            raise WorkloadError(f"pool {name_of_pool}: a requested row has no list")
-                        ids, dists, fallbacks = answers.answer(
-                            stream_ids[list_rows], stream_dists[list_rows],
-                            lambda missing, rows=rows, pool=pool: pool.vectors[rows[missing]],
-                            stream_k, inserted, deleted_mask,
-                        )
-                        stream_fallbacks[name_of_pool] += fallbacks
-
-                    step_queries = int(last - first)
-                    for index, name in enumerate(names):
-                        stream = streams[name_of_pool][name]
+                    set_dir = set_dirs[pool.spec.name]
+                    # The queries of this step, per stream (their answers come later, from
+                    # the follow-up stage of stream_gt.py).
+                    for name, stream in streams[pool.spec.name].items():
                         writer.submit(
                             write_array, set_dir / name / _step_name(step, suffix),
                             pool.vectors[stream.pool_index[first:last]],
@@ -987,13 +859,6 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
                             write_ids, set_dir / name / _step_name(step, ".group_id.ibin"),
                             stream.group_ids[first:last],
                         )
-                        if with_stream_gt:
-                            part = slice(index * step_queries, (index + 1) * step_queries)
-                            writer.submit(
-                                write_groundtruth,
-                                set_dir / "groundtruth" / name / _step_name(step, ".bin"),
-                                ids[part], dists[part],
-                            )
                 if computing_shared and step in checkpoints:
                     eval_fallbacks += eval_answer(inserted, deleted_mask, mix_shared, step)
                 if step % 10 == 0 or step == num_steps:
@@ -1017,7 +882,7 @@ def _build_sets(context: _BuildContext) -> List[_SetRecord]:
                 link_tree(mix_shared, set_dir)
                 record = _finish_set(
                     context, pool, mix, schedule, checkpoints, streams[pool.spec.name], set_dir,
-                    stream_fallbacks[pool.spec.name], eval_fallbacks,
+                    eval_fallbacks,
                 )
                 records.append(record)
             if resume is not None:
@@ -1044,7 +909,6 @@ def _finished_records(context: _BuildContext, mix: RequestMix) -> List[_SetRecor
         records.append(
             _SetRecord(
                 pool, mix, set_dir, sha256_file(manifest_path),
-                int(groundtruth["stream_requests_answered_by_scan"] or 0),
                 int(groundtruth["eval_requests_answered_by_scan"]),
             )
         )
@@ -1060,6 +924,8 @@ def _set_config(config: WorkloadConfig, spec: PoolSpec) -> dict:
     """
     description = dataclasses.asdict(config)
     description.pop("existing", None)
+    for key in STREAM_STAGE_SETTINGS:
+        description["groundtruth"].pop(key, None)
     if spec.kind == "n2":
         description["groups"]["group_sizes"] = (spec.group_size,)
         description["groups"]["target_overlaps"] = (spec.target_overlap,)
@@ -1074,7 +940,6 @@ def _finish_set(
     checkpoints: List[int],
     streams: Dict[str, Stream],
     set_dir: Path,
-    stream_fallbacks: int,
     eval_fallbacks: int,
 ) -> _SetRecord:
     """Hash the files of one set and write its workload.json."""
@@ -1105,8 +970,6 @@ def _finish_set(
         environment["cupy"] = cupy.__version__
 
     source = context.source
-    # Without stream ground truth there are no stream lists: the counts about them are null.
-    stream_gt = context.stream_lists is not None
     manifest = {
         "format_version": FORMAT_VERSION,
         "tool_version": __version__,
@@ -1156,14 +1019,13 @@ def _finish_set(
         },
         "groundtruth": {
             "method": "universe_lists",
-            "stream_groundtruth": stream_gt,
+            # The follow-up stage (stream_gt.py) answers the stream queries later. It records
+            # every finished stream below and sets stream_groundtruth to true when all
+            # streams of this set are answered.
+            "stream_groundtruth": False,
+            "stream": {},
             "universe_size": base_set.num_base + context.universe_inserts,
-            "stream_list_length": context.stream_lists.list_length if stream_gt else None,
             "eval_list_length": context.eval_list_length,
-            "distinct_query_vectors": context.distinct_queries,
-            "pool_rows_with_own_list": pool.own_rows if stream_gt else None,
-            "pool_rows_sharing_a_list": pool.shared_rows if stream_gt else None,
-            "stream_requests_answered_by_scan": stream_fallbacks if stream_gt else None,
             "eval_requests_answered_by_scan": eval_fallbacks,
             "base_batch_rows": plan.base_batch_rows,
             "query_chunk_rows": plan.query_chunk_rows,
@@ -1181,8 +1043,7 @@ def _finish_set(
     manifest_path = set_dir / "workload.json"
     write_json(manifest_path, manifest)
     return _SetRecord(
-        pool, mix, set_dir, hash_files([manifest_path], 1)[manifest_path][1],
-        stream_fallbacks, eval_fallbacks,
+        pool, mix, set_dir, hash_files([manifest_path], 1)[manifest_path][1], eval_fallbacks,
     )
 
 

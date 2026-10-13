@@ -123,7 +123,7 @@ def test_workload_config_defaults_and_values(tmp_path):
     assert cfg.existing == "error"
     assert cfg.groups.include_original is False
     assert cfg.stream.zipf_exponents == (0.3, 0.6, 0.99)
-    assert cfg.groundtruth.stream_k == 10 and cfg.evaluation.eval_k == 100
+    assert cfg.groundtruth.stream_k == 120 and cfg.evaluation.eval_k == 100
     assert cfg.stream.total_requests == 1000
     assert cfg.updates.update_percents == (0.0, 25.0, 50.0)
     assert [mix.name for mix in cfg.request_mixes()] == ["u0", "u25", "u50"]
@@ -131,12 +131,59 @@ def test_workload_config_defaults_and_values(tmp_path):
     assert cfg.groundtruth.device == "cpu"
 
 
-def test_stream_groundtruth_is_on_by_default_and_can_be_switched_off(tmp_path):
-    assert config.load_workload_config(write(tmp_path, WORKLOAD_INI)).groundtruth.stream_groundtruth is True
-    text = replace(WORKLOAD_INI, "device = cpu", "device = cpu\nstream_groundtruth = false")
-    off = config.load_workload_config(write(tmp_path, text))
-    assert off.groundtruth.stream_groundtruth is False
-    assert off.groundtruth.stream_k == 10  # the other settings are untouched
+def test_stream_groundtruth_is_off_by_default_and_can_be_switched_on(tmp_path):
+    # The follow-up stage can take long on large data, so it never runs unasked.
+    default = config.load_workload_config(write(tmp_path, WORKLOAD_INI)).groundtruth
+    assert default.stream_groundtruth is False
+    assert default.stream_k == 120 and default.stream_pools == ("all",)
+    assert default.progress_seconds == 60
+    text = replace(
+        WORKLOAD_INI, "device = cpu", "device = cpu\nstream_groundtruth = true\nstream_k = 120"
+    )
+    on = config.load_workload_config(write(tmp_path, text)).groundtruth
+    assert on.stream_groundtruth is True and on.stream_k == 120
+
+
+def test_stream_k_must_not_be_smaller_than_eval_k_when_the_stage_runs(tmp_path):
+    text = replace(
+        WORKLOAD_INI, "device = cpu", "device = cpu\nstream_groundtruth = true\nstream_k = 99"
+    )
+    with pytest.raises(config.ConfigError, match="stream_k .*must not be smaller than.*eval_k"):
+        config.load_workload_config(write(tmp_path, text))  # stream_k 99 < eval_k 100
+    # The default depth (120) is deeper than the default eval_k (100): no complaint.
+    on = replace(WORKLOAD_INI, "device = cpu", "device = cpu\nstream_groundtruth = true")
+    assert config.load_workload_config(write(tmp_path, on)).groundtruth.stream_k == 120
+    # With the stage off the value is not used, so a small one is fine.
+    off = replace(WORKLOAD_INI, "device = cpu", "device = cpu\nstream_k = 3")
+    assert config.load_workload_config(write(tmp_path, off)).groundtruth.stream_k == 3
+
+
+def test_stream_k_equal_to_eval_k_is_allowed_with_a_warning(tmp_path):
+    text = replace(
+        WORKLOAD_INI, "device = cpu", "device = cpu\nstream_groundtruth = true\nstream_k = 100"
+    )
+    with pytest.warns(UserWarning, match="stream_k equals eval_k"):
+        cfg = config.load_workload_config(write(tmp_path, text))
+    assert cfg.groundtruth.stream_k == 100
+
+
+def test_stream_pools_accepts_all_or_names_and_globs(tmp_path):
+    def pools(value):
+        text = replace(WORKLOAD_INI, "device = cpu", f"device = cpu\nstream_pools = {value}")
+        return config.load_workload_config(write(tmp_path, text)).groundtruth.stream_pools
+
+    assert pools("all") == ("all",)
+    assert pools("o50/g200, o80/*") == ("o50/g200", "o80/*")
+    for bad in ("all, o50/g200", "../x", "/abs", " , "):
+        text = replace(WORKLOAD_INI, "device = cpu", f"device = cpu\nstream_pools = {bad}")
+        with pytest.raises(config.ConfigError, match="stream_pools"):
+            config.load_workload_config(write(tmp_path, text))
+
+
+def test_progress_seconds_must_be_a_positive_integer(tmp_path):
+    text = replace(WORKLOAD_INI, "device = cpu", "device = cpu\nprogress_seconds = 0")
+    with pytest.raises(config.ConfigError, match="progress_seconds"):
+        config.load_workload_config(write(tmp_path, text))
 
 
 def test_stream_groundtruth_must_be_true_or_false(tmp_path):

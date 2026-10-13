@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from semantic_vdb import base_set as base_set_module
-from semantic_vdb import binio, config, layout, manifest, n2, parallel, workload
+from semantic_vdb import binio, config, layout, manifest, n2, parallel, stream_gt, workload
 from reference import reference_knn
 from test_groundtruth import gpu_available
 
@@ -80,7 +80,8 @@ def workload_config(base_set, query_path, name="wl", mode="public_queries", devi
         updates=config.UpdatesConfig(seed=21, update_percents=(25.0,)),
         evaluation=config.EvaluationConfig("original", None, checkpoint_every=3, eval_k=10),
         groundtruth=config.GroundTruthConfig(
-            stream_k=5, device=device, base_batch_rows=97, query_chunk_rows=13
+            stream_k=5, device=device, base_batch_rows=97, query_chunk_rows=13,
+            stream_groundtruth=True,
         ),
         # The only GPU test uses GPU 1 (see test_gpu_and_cpu_produce_identical_workloads).
         parallel=cpu_parallel() if device == "cpu" else config.ParallelConfig(
@@ -132,9 +133,10 @@ def verify_workload(directory, base_set, num_steps, group_size):
     pool = read_all(directory / "pool" / f"pool{suffix}")
     pool_groups = binio.read_ids(directory / "pool" / "pool_group_id.ibin")
     eval_queries = read_all(directory / f"eval_query{suffix}")
-    stream_k = info["config"]["groundtruth"]["stream_k"]
-    stream_gt = info["config"]["groundtruth"]["stream_groundtruth"]
-    assert info["groundtruth"]["stream_groundtruth"] == stream_gt
+    # The stage that answers the stream queries records what it did in the set's manifest;
+    # the recorded configuration no longer holds its settings.
+    stream_gt = info["groundtruth"]["stream_groundtruth"]
+    stream_k = info["groundtruth"].get("stream_k")
     eval_k = info["config"]["evaluation"]["eval_k"]
 
     # Independent re-execution of the update schedule from the delete files.
@@ -505,7 +507,7 @@ def test_a_build_interrupted_between_sets_continues_with_the_same_files(dataset,
 
     # Nothing before the sets is computed again, and the two finished sets are kept.
     assert counter.calls["find_alpha"] == 0 and counter.calls["make_pool"] == 0
-    assert counter.calls["pool_statistics"] == 0 and counter.calls["scan_lists"] == ["stream", "eval"]
+    assert counter.calls["pool_statistics"] == 0 and counter.calls["scan_lists"] == ["eval"]
     assert counter.calls["finish_set"] == 4  # 2 pools x (u25, u50)
     assert set_files(family) == set_files(clean)
     for pool in ("g3", "g6"):
@@ -857,7 +859,7 @@ def test_external_groups_are_used_as_given_with_unequal_sizes(dataset):
         assert sorted(row.tobytes() for row in in_pool) == sorted(row.tobytes() for row in expected)
 
     # Every stream query is a member of its group, and every GT file is exact.
-    stream_k = info["config"]["groundtruth"]["stream_k"]
+    stream_k = info["groundtruth"]["stream_k"]
     base = read_all(base_set.directory / "base.u8bin")
     for name in info["streams"]:
         for step_path in sorted((directory / name).glob("step_*.u8bin")):
@@ -968,7 +970,12 @@ def test_every_pair_of_group_size_and_percentage_is_a_complete_verified_set(data
             groundtruth = info["groundtruth"]
             assert groundtruth["method"] == "universe_lists"
             # With the default list length no request needs the slow scan.
-            assert groundtruth["stream_requests_answered_by_scan"] == 0
+            assert groundtruth["stream_groundtruth"] is True
+            assert all(
+                record["complete"] and record["requests_answered_by_scan"] == 0
+                for record in groundtruth["stream"].values()
+            )
+            assert sorted(groundtruth["stream"]) == sorted(info["streams"])
             assert groundtruth["eval_requests_answered_by_scan"] == 0
 
 
@@ -990,8 +997,11 @@ def test_without_stream_groundtruth_only_the_evaluation_queries_are_scored(datas
         return original_scan(queries, list_length, *args, **kwargs)
 
     monkeypatch.setattr(workload, "scan_lists", recording_scan)
+    monkeypatch.setattr(stream_gt, "scan_lists", recording_scan)
     full = workload.build_workload(family_config(base_set, dataset["query_path"]))
-    assert [name for name, _ in scans] == ["stream", "eval"]
+    # The build scans the 40 evaluation queries; the follow-up stage then scans the distinct
+    # stream queries (named "list" there).
+    assert [name for name, _ in scans] == ["eval", "list"]
     scans.clear()
     light = workload.build_workload(
         family_config(
@@ -1018,9 +1028,8 @@ def test_without_stream_groundtruth_only_the_evaluation_queries_are_scored(datas
             assert entry["sha256"] == full_files[relative]["sha256"], relative
 
         info = workload_manifest(light_set)["groundtruth"]
-        assert info["stream_groundtruth"] is False
-        assert info["stream_list_length"] is None and info["distinct_query_vectors"] is None
-        assert info["pool_rows_with_own_list"] is None and info["stream_requests_answered_by_scan"] is None
+        assert info["stream_groundtruth"] is False and info["stream"] == {}
+        assert "stream_k" not in info and "stream_list_length" not in info
         assert info["eval_list_length"] == workload_manifest(full_set)["groundtruth"]["eval_list_length"]
         assert workload_manifest(full_set)["groundtruth"]["stream_groundtruth"] is True
 
@@ -1112,16 +1121,31 @@ def test_alpha_is_searched_once_for_all_group_sizes(dataset, monkeypatch):
     assert len(alphas) == 1
 
 
-def test_a_smaller_pool_borrows_the_lists_of_the_larger_one(dataset):
+def test_equal_vectors_of_different_pools_share_one_list(dataset):
     base_set = build_base(dataset)
     family = workload.build_workload(sizes_config(base_set, dataset["query_path"]))
-    small = workload_manifest(family / "o70" / "g3" / "u25")["groundtruth"]
-    large = workload_manifest(family / "o70" / "g6" / "u25")["groundtruth"]
-    # The first three members of a group are the same vectors in both pools.
-    assert small["pool_rows_sharing_a_list"] > 0
-    assert small["pool_rows_with_own_list"] + small["pool_rows_sharing_a_list"] > 0
-    assert large["pool_rows_sharing_a_list"] > 0 and large["pool_rows_with_own_list"] == 0
-    assert small["distinct_query_vectors"] == large["distinct_query_vectors"]  # one scan for both
+
+    # Independent count: the distinct query vectors in the stream files of the whole family,
+    # and the same count pool by pool.
+    per_pool = {}
+    for size in (3, 6):
+        rows = set()
+        for path in (family / "o70" / f"g{size}").glob("u*/stream_*/step_*.u8bin"):
+            rows.update(row.tobytes() for row in read_all(path))
+        per_pool[size] = rows
+    union = per_pool[3] | per_pool[6]
+
+    store = stream_gt.ListStore(family / "shared" / "stream_lists")
+    universe = workload_manifest(family / "o70" / "g3" / "u25")["groundtruth"]["universe_size"]
+    stored = sum(
+        manifest.read_json(path / "meta.json")["count"]
+        for path in sorted((family / "shared" / "stream_lists").glob("segment_*"))
+    )
+    assert stored == len(union)  # one list per distinct vector, whatever pool it came from
+    # The first three members of a group are the same vectors in both pools, so sharing
+    # really saved lists: separate lists per pool would be more.
+    assert len(union) < len(per_pool[3]) + len(per_pool[6])
+    assert universe > 0 and store is not None
 
 
 def test_every_pool_of_a_family_matches_a_build_of_that_size_alone(dataset):
@@ -1161,7 +1185,9 @@ def test_lists_that_are_too_short_fall_back_to_scanning_and_stay_exact(dataset, 
     base_set = build_base(dataset)
     # Lists of exactly k entries: with 60% updates only about a third of the universe is
     # alive, so most lists lose entries and the fallback has to answer.
-    monkeypatch.setattr(workload, "choose_list_length", lambda needed, alive, size, *a, **k: needed)
+    too_short = lambda needed, alive, size, *a, **k: needed  # noqa: E731
+    monkeypatch.setattr(workload, "choose_list_length", too_short)
+    monkeypatch.setattr(stream_gt, "choose_list_length", too_short)
     family = workload.build_workload(
         sizes_config(base_set, dataset["query_path"], sizes=(6,), percents=(0.0, 60.0))
     )
@@ -1169,7 +1195,8 @@ def test_lists_that_are_too_short_fall_back_to_scanning_and_stay_exact(dataset, 
         directory = family / "o70" / "g6" / set_name
         verify_workload(directory, base_set, NUM_STEPS, group_size=6)
         groundtruth = workload_manifest(directory)["groundtruth"]
-        assert groundtruth["stream_requests_answered_by_scan"] > 0, set_name
+        scanned = sum(r["requests_answered_by_scan"] for r in groundtruth["stream"].values())
+        assert scanned > 0, set_name
         assert groundtruth["eval_requests_answered_by_scan"] > 0, set_name
 
 
@@ -1241,7 +1268,10 @@ def test_a_numa_node_that_does_not_exist_is_an_error(dataset):
 
 def test_the_resolved_batch_sizes_are_recorded(dataset):
     base_set = build_base(dataset)
-    auto = config.GroundTruthConfig(stream_k=5, device="cpu", base_batch_rows=None, query_chunk_rows=None)
+    auto = config.GroundTruthConfig(
+        stream_k=5, device="cpu", base_batch_rows=None, query_chunk_rows=None,
+        stream_groundtruth=True,
+    )
     family = workload.build_workload(
         sizes_config(base_set, dataset["query_path"], sizes=(6,), percents=(25.0,), groundtruth=auto)
     )

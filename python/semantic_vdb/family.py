@@ -34,6 +34,11 @@ _IGNORED_FOR_COMMON = ("parallel", "existing", "name", "base_set_dir")
 _PATH_SETTINGS = {"seeds": ("query_file", "group_id_file"), "evaluation": ("eval_file",)}
 # The two lists that define the pools; a run is allowed to bring other values for them.
 _POOL_AXES = ("group_sizes", "target_overlaps")
+# [groundtruth] settings of the follow-up stage that answers the stream queries (stream_gt.py).
+# They steer a stage that may run later, on a family that exists, so they are no part of what
+# the pools have in common. Families made before the stage existed stored them in "common",
+# which is why they are removed from the stored fingerprint as well (see ``check_common``).
+_STREAM_STAGE_SETTINGS = ("stream_groundtruth", "stream_k", "stream_pools", "progress_seconds")
 
 
 class FamilyError(RuntimeError):
@@ -54,6 +59,7 @@ def common_fingerprint(config, base_set, inputs: dict) -> dict:
     description["groups"] = {
         key: value for key, value in description["groups"].items() if key not in _POOL_AXES
     }
+    description["groundtruth"] = _without_stream_stage(description["groundtruth"])
     for section, keys in _PATH_SETTINGS.items():
         description[section] = {
             key: value for key, value in description[section].items() if key not in keys
@@ -104,9 +110,19 @@ def read_existing_family(directory: Path) -> ExistingFamily:
     return ExistingFamily(directory, index, SharedStore(directory / "shared"))
 
 
+def _without_stream_stage(groundtruth: dict) -> dict:
+    """The ``[groundtruth]`` settings without those of the stream answering stage."""
+    return {key: value for key, value in groundtruth.items() if key not in _STREAM_STAGE_SETTINGS}
+
+
 def check_common(existing: ExistingFamily, current: dict) -> None:
     """Raise ``FamilyError`` unless the configuration fits the family it would extend."""
     stored = existing.index["common"]
+    # An older family stored the stage settings too; they must not make it look different.
+    if "groundtruth" in stored.get("config", {}):
+        stored = dict(stored)
+        stored["config"] = dict(stored["config"])
+        stored["config"]["groundtruth"] = _without_stream_stage(stored["config"]["groundtruth"])
     if stored != current:
         raise FamilyError(
             f"the configuration differs from the family {existing.directory.name} in "

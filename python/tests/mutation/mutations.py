@@ -153,11 +153,10 @@ MUTATIONS += [
         "        return queries @ block.T",
     ),
     Mutation(
-        "G2",
-        "each merge keeps only k-1 winners instead of k (off-by-one in the slice)",
+        "G2", "each dense merge keeps only k-1 winners instead of k (off-by-one in the slice)",
         GROUNDTRUTH,
-        "                merged = xp.partition(merged, self.k - 1, axis=1)[:, : self.k]",
-        "                merged = xp.partition(merged, self.k - 1, axis=1)[:, : self.k - 1]",
+        "            merged = xp.partition(merged, self.k - 1, axis=1)[:, : self.k]",
+        "            merged = xp.partition(merged, self.k - 1, axis=1)[:, : self.k - 1]",
     ),
     Mutation(
         "G3",
@@ -195,11 +194,10 @@ MUTATIONS += [
         "xp.ascontiguousarray(distances, dtype=xp.float32)",
     ),
     Mutation(
-        "G9",
-        "negative distances are encoded with the wrong bit transform",
+        "G9", "negative distances are encoded with the wrong bit transform",
         GROUNDTRUTH,
-        "    ordered = xp.where(is_negative, ~bits, bits | xp.uint32(0x80000000))",
-        "    ordered = xp.where(is_negative, bits, bits | xp.uint32(0x80000000))",
+        "    return xp.where(is_negative, ~bits, bits | xp.uint32(0x80000000))",
+        "    return xp.where(is_negative, bits, bits | xp.uint32(0x80000000))",
     ),
     Mutation(
         "G10",
@@ -209,11 +207,10 @@ MUTATIONS += [
         "        return distances",
     ),
     Mutation(
-        "G11",
-        "the running best is dropped when a new block is merged",
+        "G11", "the running best is dropped when a new block is merged",
         GROUNDTRUTH,
-        "            merged = xp.concatenate([self._best[chunk_index], keys], axis=1)",
-        "            merged = keys",
+        "        merged = xp.concatenate([self._best[chunk_index], keys], axis=1)",
+        "        merged = keys",
     ),
 ]
 
@@ -488,11 +485,10 @@ MUTATIONS += [
         ),
     ),
     Mutation(
-        "W4",
-        "ground truth is computed for the stream queries in reverse order",
-        WORKLOAD,
-        "[streams[name_of_pool][name].pool_index[first:last] for name in names]",
-        "[streams[name_of_pool][name].pool_index[first:last][::-1] for name in names]",
+        "W4", "the answers of the stream queries are looked up in reverse order",
+        "semantic_vdb/stream_gt.py",
+        "            rows = store.find(digests_as_array(row_digests(queries)))\n",
+        "            rows = store.find(digests_as_array(row_digests(queries)))[::-1]\n",
     ),
     Mutation(
         "W5",
@@ -899,7 +895,7 @@ MUTATIONS += [
         EXAMPLE_INI,
         "; eval_k = 100\n",
         "",
-        also=((EXAMPLE_INI, "; stream_k = 10\n", "; stream_k = 10\n; eval_k = 100\n"),),
+        also=((EXAMPLE_INI, "; stream_k = 120\n", "; stream_k = 120\n; eval_k = 100\n"),),
     ),
 
 ]
@@ -972,46 +968,22 @@ MUTATIONS += [
         "                list_ids[first:last] = result.neighbour_ids[::-1]\n",
     ),
     Mutation(
-        "Y9",
-        "a smaller pool finds the list of the wrong member of the reference pool",
+        "Y12", "a request whose list is too short is not answered by scanning (the unusable row is returned)",
         UNIVERSE,
-        "        mapped = (requested // size) * reference_size + (requested % size)\n",
-        "        mapped = (requested // size) * size + (requested % size)\n",
-    ),
-    Mutation(
-        "Y10",
-        "lists are shared between pools without checking that the vectors are equal",
-        UNIVERSE,
-        "        matches = same[requested]\n",
-        "        matches = np.ones_like(same[requested])\n",
-    ),
-    Mutation(
-        "Y11",
-        "the equality check compares the LAST members of a group instead of the first ones",
-        UNIVERSE,
-        ")[:, :size, :]\n        equal[",
-        ")[:, -size:, :]\n        equal[",
-    ),
-    Mutation(
-        "Y12",
-        "a request whose list is too short is not answered by scanning (the unusable row is returned)",
-        WORKLOAD,
         "        missing = np.flatnonzero(~enough)\n",
         "        missing = np.flatnonzero(~enough)[:0]\n",
     ),
     Mutation(
-        "Y13",
-        "the scan of the active set ignores the insertions of the step",
-        WORKLOAD,
+        "Y13", "the scan of the active set ignores the insertions of the step",
+        UNIVERSE,
         "            result = self._scanner.top(unique_vectors, k, inserted, deleted_mask)\n",
         "            result = self._scanner.top(unique_vectors, k, 0, deleted_mask)\n",
     ),
     Mutation(
-        "Y14",
-        "the step's insertions are alive one step too early",
-        WORKLOAD,
-        "        alive_limit = self._context.base_set.num_base + inserted\n",
-        "        alive_limit = self._context.base_set.num_base + inserted + 1\n",
+        "Y14", "the step's insertions are alive one step too early",
+        UNIVERSE,
+        "        alive_limit = self._num_base + inserted\n",
+        "        alive_limit = self._num_base + inserted + 1\n",
     ),
     Mutation(
         "Y15",
@@ -1370,6 +1342,7 @@ MUTATIONS += [
 SHARED_STORE = "semantic_vdb/shared_store.py"
 FAMILY = "semantic_vdb/family.py"
 EXTEND = "semantic_vdb/extend.py"
+STREAM_GT_FILE = "semantic_vdb/stream_gt.py"
 
 MUTATIONS += [
     # ---- names and configuration ------------------------------------------------------
@@ -1478,18 +1451,6 @@ MUTATIONS += [
         "    for size in config.groups.group_sizes:\n        for target in config.groups.target_overlaps:\n            overlap_name = overlap_dir_name(target)\n            specs.append(",
     ),
     Mutation(
-        "W17", "the list rows of every overlap level start at 0 (they are not shifted behind the earlier levels)",
-        WORKLOAD,
-        "            pool.list_index = np.where(index >= 0, index + offset, -1)",
-        "            pool.list_index = index",
-    ),
-    Mutation(
-        "W18", "all pools are planned together for the stream lists, whatever their overlap",
-        WORKLOAD,
-        "        groups.setdefault(pool.spec.overlap_name, []).append(pool)",
-        "        groups.setdefault(None, []).append(pool)",
-    ),
-    Mutation(
         "W19", "workload.json keeps the whole list of target overlaps of the build",
         WORKLOAD,
         "        description[\"groups\"][\"target_overlaps\"] = (spec.target_overlap,)",
@@ -1498,8 +1459,8 @@ MUTATIONS += [
     Mutation(
         "W20", "workload.json records the existing policy of the run",
         WORKLOAD,
-        "    description.pop(\"existing\", None)\n    if spec.kind == \"n2\":",
-        "    if spec.kind == \"n2\":",
+        "    description.pop(\"existing\", None)\n    for key in STREAM_STAGE_SETTINGS:",
+        "    for key in STREAM_STAGE_SETTINGS:",
     ),
     Mutation(
         "W21", "a family index of a new family has no common fingerprint",
@@ -1761,5 +1722,253 @@ MUTATIONS += [
         CLI,
         "        _log(f\"error: {error}\")\n        return 1",
         "        _log(f\"error: {error}\")\n        return 0",
+    ),
+    # ---- round 00077: the filtered merge of the scan (Part A) -----------------------------------
+    Mutation(
+        "K1", "the filter drops entries that tie with the threshold (ties are lost)",
+        GT_ENGINE,
+        "        keep = ~(distances > self._threshold[chunk_index][:, None])",
+        "        keep = distances < self._threshold[chunk_index][:, None]",
+    ),
+    Mutation(
+        "K2", "the portable filter uses the threshold of another query row",
+        GT_ENGINE,
+        "        keep = ~(distances > self._threshold[chunk_index][:, None])",
+        "        keep = ~(distances > xp.roll(self._threshold[chunk_index], 1)[:, None])",
+    ),
+    Mutation(
+        "K3", "the portable filter forgets the current winners when it merges the survivors",
+        GT_ENGINE,
+        "        candidates[:, :k] = best\n        candidates[rows, k + slot] = keys",
+        "        candidates[rows, k + slot] = keys",
+    ),
+    Mutation(
+        "K4", "survivors of a query are written to the wrong slot (every query starts at slot 1)",
+        GT_ENGINE,
+        "        slot = xp.arange(total) - first_of_row[rows]",
+        "        slot = xp.arange(total) - first_of_row[rows] + 1\n        width = width + 1",
+    ),
+    Mutation(
+        "K5", "the threshold is never refreshed after a merge",
+        GT_ENGINE,
+        "        self._threshold[chunk_index] = threshold\n",
+        "",
+    ),
+    Mutation(
+        "K6", "a chunk is treated as full before every query holds k entries",
+        GT_ENGINE,
+        "        return threshold, not bool(is_empty.any())",
+        "        return threshold, True",
+    ),
+    Mutation(
+        "K7", "an empty slot is read as a real k-th distance",
+        GT_ENGINE,
+        "        threshold = xp.where(is_empty, xp.float32(xp.inf), kth_distance).astype(xp.float32)",
+        "        threshold = kth_distance.astype(xp.float32)",
+    ),
+    Mutation(
+        "K8", "the kernel filter drops entries that tie with the threshold",
+        GT_ENGINE,
+        "    if (distance > threshold[row]) {\n        return;\n    }",
+        "    if (distance >= threshold[row]) {\n        return;\n    }",
+    ),
+    Mutation(
+        "K9", "the kernel skips the clamp of negative l2 values at zero",
+        GT_ENGINE,
+        "        distance = (value != value) ? value : (value > 0.0f ? value : 0.0f);",
+        "        distance = value;",
+    ),
+    Mutation(
+        "K10", "the kernel writes survivors one column too far to the right",
+        GT_ENGINE,
+        "    candidates[(long long)row * (num_best + width) + num_best + slot] =",
+        "    candidates[(long long)row * (num_best + width) + num_best + slot + 1] =",
+    ),
+    Mutation(
+        "K11", "the kernel keeps the sign of an l2 zero out of the key (-0.0 sorts apart)",
+        GT_ENGINE,
+        "    const unsigned int bits = __float_as_uint(__fadd_rn(distance, 0.0f));",
+        "    const unsigned int bits = __float_as_uint(distance);",
+    ),
+    Mutation(
+        "K12", "an overflowing query (more survivors than slots) is not sent to the dense merge",
+        GT_ENGINE,
+        "        if most > width:\n            return None",
+        "        if False:\n            return None",
+    ),
+    Mutation(
+        "K13", "the inner-product kernel path uses +dot instead of -dot",
+        GT_ENGINE,
+        "        distance = -dot[index];",
+        "        distance = dot[index];",
+    ),
+    Mutation(
+        "K14", "the dense merge is skipped for a chunk that is not full yet",
+        GT_ENGINE,
+        "            if self._chunk_is_full[chunk_index] and self._device_kernel:",
+        "            if self._device_kernel:",
+    ),
+    # ---- round 00077: the stage that answers the stream queries (Part B) ------------------------
+    Mutation(
+        "H1", "the answer of a step ignores the deletions of that step",
+        STREAM_GT_FILE,
+        "            if delete_path.exists():\n                deleted_mask[read_ids(delete_path)] = True",
+        "            if False:\n                deleted_mask[read_ids(delete_path)] = True",
+    ),
+    Mutation(
+        "H2", "the inserted vectors of a step are counted one step late",
+        STREAM_GT_FILE,
+        "            inserted += int(schedule[\"inserts_per_step\"][step - 1])\n\n            queries",
+        "            queries",
+    ),
+    Mutation(
+        "H3", "the stage records a pair as complete before its files are renamed into place",
+        STREAM_GT_FILE,
+        "    shutil.rmtree(pair.final_dir, ignore_errors=True)\n    os.replace(pair.tmp_dir, pair.final_dir)",
+        "    shutil.rmtree(pair.final_dir, ignore_errors=True)\n    pair.final_dir.mkdir(parents=True)",
+    ),
+    Mutation(
+        "H4", "the digest ignores the element type and length of a vector",
+        STREAM_GT_FILE,
+        "    prefix = f\"{rows.dtype.str}:{rows.shape[1]}:\".encode()",
+        "    prefix = b\"\"",
+    ),
+    Mutation(
+        "H5", "the digest index returns the position in sorted order instead of the input",
+        STREAM_GT_FILE,
+        "        result[single[match]] = self._position[low[single[match]]]",
+        "        result[single[match]] = low[single[match]]",
+    ),
+    Mutation(
+        "H6", "equal first halves of two digests are not told apart",
+        STREAM_GT_FILE,
+        "        for index in np.flatnonzero(run > 1):\n            for candidate in range(low[index], high[index]):\n                if self._second[candidate] == digests[index, 1]:",
+        "        for index in np.flatnonzero(run > 1):\n            for candidate in range(low[index], high[index]):\n                if True:",
+    ),
+    Mutation(
+        "H7", "an answer made for another stream_k is taken for complete",
+        STREAM_GT_FILE,
+        "        return \"complete\" if record[\"stream_k\"] == stream_k else \"mismatch\"",
+        "        return \"complete\"",
+    ),
+    Mutation(
+        "H8", "pairs that are complete are computed again",
+        STREAM_GT_FILE,
+        "            if state == \"complete\":\n                complete.append(pair)",
+        "            if state == \"complete\":\n                pending.append(pair)",
+    ),
+    Mutation(
+        "H9", "a pool name that matches nothing is silently ignored",
+        STREAM_GT_FILE,
+        "        if not matches:\n            raise StreamGtError(",
+        "        if False:\n            raise StreamGtError(",
+    ),
+    Mutation(
+        "H10", "a finished segment of lists is checked against a size only, not its hash",
+        STREAM_GT_FILE,
+        "            if sha256_file(path) != recorded[\"sha256\"]:",
+        "            if False:",
+    ),
+    Mutation(
+        "H11", "lists made for another universe are accepted",
+        STREAM_GT_FILE,
+        "            if meta[\"universe\"] != universe:",
+        "            if False:",
+    ),
+    Mutation(
+        "H12", "the stage does not remove the .tmp_ folders of an interrupted run",
+        STREAM_GT_FILE,
+        "        for leftover in sorted(self.directory.glob(TMP_PREFIX + \"*\")):\n            shutil.rmtree(leftover, ignore_errors=True)",
+        "        pass",
+    ),
+    Mutation(
+        "H13", "the family index keeps the old hash of a workload.json that the stage changed",
+        STREAM_GT_FILE,
+        "        if entry.get(\"workload_json_sha256\") != current:\n            entry[\"workload_json_sha256\"] = current\n            changed += 1",
+        "        if entry.get(\"workload_json_sha256\") is None:\n            entry[\"workload_json_sha256\"] = current\n            changed += 1",
+    ),
+    Mutation(
+        "H14", "the disk space check is skipped",
+        STREAM_GT_FILE,
+        "    if (answer_bytes + list_bytes) * 1.05 > free:",
+        "    if False:",
+    ),
+    Mutation(
+        "H15", "the progress line reports the speed of the whole run as the recent speed",
+        STREAM_GT_FILE,
+        "        first_time, first_done = self._samples[0]",
+        "        first_time, first_done = self._started, self._start_done",
+    ),
+    Mutation(
+        "H16", "the time left is computed from the wrong remaining count",
+        STREAM_GT_FILE,
+        "            format_duration((self._total - self._done) / recent)",
+        "            format_duration(self._total / recent)",
+    ),
+    Mutation(
+        "H17", "the stage settings are part of the common fingerprint again",
+        FAMILY,
+        "    description[\"groundtruth\"] = _without_stream_stage(description[\"groundtruth\"])\n",
+        "",
+    ),
+    Mutation(
+        "H18", "a family of the previous version is refused because it stored the stage settings",
+        FAMILY,
+        "    if \"groundtruth\" in stored.get(\"config\", {}):",
+        "    if False:",
+    ),
+    Mutation(
+        "H19", "the follow-up stage is not run for an extended family",
+        WORKLOAD,
+        "        _answer_stream_queries(config, base_set, family_dir, log)\n        return family_dir",
+        "        return family_dir",
+    ),
+    Mutation(
+        "H20", "the follow-up stage ignores stream_groundtruth = false",
+        WORKLOAD,
+        "    if not config.groundtruth.stream_groundtruth:\n        return\n    # Imported here because stream_gt.py builds on this module.",
+        "    # Imported here because stream_gt.py builds on this module.",
+    ),
+    Mutation(
+        "H21", "stream_k smaller than eval_k is accepted",
+        CONFIG,
+        "    if gt.stream_k < eval_k:\n        raise ConfigError(",
+        "    if False:\n        raise ConfigError(",
+    ),
+    Mutation(
+        "H22", "a pool pattern is matched as a prefix instead of a glob",
+        STREAM_GT_FILE,
+        "        matches = [name for name in pool_names if fnmatch.fnmatchcase(name, pattern)]",
+        "        matches = [name for name in pool_names if name.startswith(pattern.rstrip(\"*\"))]",
+    ),
+    Mutation(
+        "H23", "the stage does not give back the GPU memory that the build cached",
+        STREAM_GT_FILE,
+        "    release_device_memory()  # the build's cached blocks must not make the GPU look busy\n",
+        "",
+    ),
+    Mutation(
+        "H24", "the default depth of the stream answers is shallower than the default eval_k",
+        CONFIG,
+        "DEFAULT_STREAM_K = 120",
+        "DEFAULT_STREAM_K = 10",
+    ),
+    Mutation(
+        "H25", "the digest covers only the first half of a vector (vectors that share it share a list)",
+        STREAM_GT_FILE,
+        "        blake(prefix + raw[start : start + stride], digest_size=DIGEST_BYTES).digest()",
+        "        blake(prefix + raw[start : start + stride // 2], digest_size=DIGEST_BYTES).digest()",
+    ),
+    Mutation(
+        "K15", "the portable filtered merge keeps only k-1 winners",
+        GT_ENGINE,
+        "        candidates[rows, k + slot] = keys\n        merged = xp.partition(candidates, k - 1, axis=1)[:, :k]",
+        "        candidates[rows, k + slot] = keys\n        merged = xp.partition(candidates, k - 1, axis=1)[:, : k - 1]",
+    ),
+    Mutation(
+        "K16", "the kernel filtered merge keeps only k-1 winners",
+        GT_ENGINE,
+        "            return self._best[chunk_index], 0\n        merged = xp.partition(candidates, k - 1, axis=1)[:, :k]",
+        "            return self._best[chunk_index], 0\n        merged = xp.partition(candidates, k - 1, axis=1)[:, : k - 1]",
     ),
 ]

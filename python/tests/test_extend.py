@@ -17,7 +17,7 @@ import sys
 
 import pytest
 
-from semantic_vdb import binio, config, extend, family, manifest, n2, workload
+from semantic_vdb import binio, config, extend, family, manifest, n2, stream_gt, workload
 from test_end_to_end import (
     NUM_STEPS,
     build_base,
@@ -32,12 +32,6 @@ from test_end_to_end import (
     workload_config,
     workload_manifest,
 )
-
-# What differs between a family and the one-build family it is compared with, and is no
-# difference of content: a family built with all its pools at once counts the distinct stream
-# vectors of the whole build, an extension of the pools it adds.
-BUILD_WIDE = ("distinct_query_vectors",)
-
 
 def make_config(
     base_set, query_path, overlaps=(0.7,), sizes=(3,), percents=(0.0, 25.0), name="fam",
@@ -144,7 +138,7 @@ def test_an_extended_family_equals_the_family_of_one_build_with_all_pools(datase
 
     reference = with_pools(make_config(base_set, query_path), **then)
     once = workload.build_workload(named(reference, "once"))
-    same_family(grown, once, ignore=BUILD_WIDE)
+    same_family(grown, once)
 
 
 def test_the_new_sets_of_an_extension_are_exact(dataset):
@@ -180,8 +174,11 @@ def test_an_extension_can_be_followed_by_another_one(dataset):
     grown = workload.build_workload(with_pools(second, overlaps=(0.7, 0.5, 0.9), sizes=(3, 6)))
 
     once = one_build(base_set, query_path, overlaps=(0.7, 0.5, 0.9), sizes=(3, 6))
-    same_family(grown, once, ignore=BUILD_WIDE)
-    assert sorted(path.name for path in grown.glob("build_report*.json")) == [
+    same_family(grown, once)
+    # One report per build or extension (the stream answering stage adds its own reports).
+    assert sorted(
+        path.name for path in grown.glob("build_report*.json") if "stream_groundtruth" not in path.name
+    ) == [
         "build_report.json",
         "build_report_extension_1.json",
         "build_report_extension_2.json",
@@ -209,7 +206,7 @@ def test_scan_counts_of_the_evaluation_answers_come_from_the_family(dataset, mon
         for name in ("u0", "u50")
     ]
     assert counts[1] > 0  # the fallback really was needed
-    same_family(grown, once, ignore=BUILD_WIDE)
+    same_family(grown, once)
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +297,7 @@ def test_an_extension_does_not_repeat_what_the_family_stored(dataset, monkeypatc
 
     searched, alphas, scans = [], [], []
     original_top, original_find = n2.BaseScanner.top, n2.find_alpha
-    original_scan = workload.scan_lists
+    original_scan = stream_gt.scan_lists
 
     def counting_top(self, queries, k):
         searched.append(k)
@@ -316,21 +313,22 @@ def test_an_extension_does_not_repeat_what_the_family_stored(dataset, monkeypatc
 
     monkeypatch.setattr(n2.BaseScanner, "top", counting_top)
     monkeypatch.setattr(n2, "find_alpha", counting_find)
-    monkeypatch.setattr(workload, "scan_lists", counting_scan)
+    monkeypatch.setattr(stream_gt, "scan_lists", counting_scan)
 
     # A new group size at the existing overlap: no neighbour scan (k = 60), no noise scale
-    # search, and no scan for the evaluation queries; only the new pool's own work.
+    # search, and no scan for the evaluation queries; only the new pool's own work. The
+    # follow-up stage scans only vectors that have no list yet (one scan here).
     workload.build_workload(with_pools(start, sizes=(3, 6)))
     assert 60 not in searched
     assert alphas == []
-    assert scans == ["stream"]
+    assert scans == ["list"]
 
     searched.clear(), alphas.clear(), scans.clear()
     # A new overlap needs its noise scale, but the neighbours still come from shared/.
     workload.build_workload(with_pools(start, overlaps=(0.7, 0.5), sizes=(3, 6)))
     assert 60 not in searched
     assert len(alphas) > 0
-    assert scans == ["stream"]
+    assert scans == ["list"]
 
 
 def test_the_evaluation_answers_of_new_sets_are_the_files_of_the_family(dataset):
@@ -409,8 +407,6 @@ SHARED_CHANGES = {
     "overlap tolerance": lambda c: replace_in(c, "groups", overlap_tolerance=0.04),
     "evaluation k": lambda c: replace_in(c, "evaluation", eval_k=7),
     "checkpoint interval": lambda c: replace_in(c, "evaluation", checkpoint_every=2),
-    "stream k": lambda c: replace_in(c, "groundtruth", stream_k=4),
-    "stream ground truth": lambda c: replace_in(c, "groundtruth", stream_groundtruth=False),
 }
 
 
@@ -548,7 +544,7 @@ def test_a_family_without_stored_neighbours_makes_them_again_and_keeps_them(data
 
     assert searched.count(60) == 1  # made again, once
     once = one_build(base_set, query_path, overlaps=(0.7, 0.5))
-    same_family(grown, once, ignore=BUILD_WIDE)  # also cache.json: n2 is back
+    same_family(grown, once)  # also cache.json: n2 is back
     # The recreated files are the ones recorded in cache.json.
     cache = manifest.read_json(grown / "shared" / "cache.json")
     for name, entry in cache["n2"]["files"].items():
@@ -581,7 +577,7 @@ def test_an_interrupted_build_of_the_new_pools_continues_and_the_family_is_untou
 
     grown = workload.build_workload(grow)
     once = one_build(base_set, query_path, overlaps=(0.7, 0.5), sizes=(3, 6))
-    same_family(grown, once, ignore=BUILD_WIDE)
+    same_family(grown, once)
     assert not (family_dir.parent / "fam.extending").exists()
 
 
@@ -670,7 +666,7 @@ def test_a_commit_that_dies_at_any_step_is_completed_by_running_again(
 
     assert any("completing the commit" in message for message in messages)
     once = one_build(base_set, query_path, overlaps=(0.7, 0.5), sizes=(3, 6))
-    same_family(grown, once, ignore=BUILD_WIDE)
+    same_family(grown, once)
     assert not (family_dir.parent / "fam.extending").exists()
 
 

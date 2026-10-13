@@ -30,6 +30,10 @@ SHARED_DIR = "_shared"  # per-pool link sources inside the .building directory, 
 PERSISTENT_SHARED_DIR = "shared"  # results of the family that stay and are reused (extension)
 UNIVERSE_DIR = "_universe"  # memory-mapped universe lists, removed at the end
 RESUME_DIR = "_resume"  # finished-stage markers of an unfinished build (see resume.py)
+# Universe lists of the stream queries, below shared/ (see stream_gt.py), and the prefix of the
+# directories that the follow-up stage fills before it renames them to their final names.
+STREAM_LISTS_DIR = "stream_lists"
+TMP_PREFIX = ".tmp_"
 
 
 def overlap_dir_name(target_overlap: float) -> str:

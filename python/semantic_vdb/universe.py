@@ -28,7 +28,7 @@ import shutil
 from dataclasses import dataclass
 from math import exp, lgamma, log, log1p
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
@@ -404,133 +404,6 @@ def _scan_on_gpu_workers(plan: ParallelPlan, ranges, per_gpu: int, make_job) -> 
 
 
 # ---------------------------------------------------------------------------
-# which vectors need a list (shared between group sizes)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PoolRequests:
-    """A pool and the rows of it that some stream requests."""
-
-    vectors: np.ndarray  # (pool_size, d)
-    requested_rows: np.ndarray  # sorted, distinct pool rows
-    # (groups, size) when the pool is "group after group with equal sizes" (N2 pools); only
-    # such pools can borrow lists from a larger pool of the same family.
-    layout: Optional[Tuple[int, int]] = None
-
-
-@dataclass
-class ListRequests:
-    vectors: np.ndarray  # (n, d) the distinct vectors to scan
-    list_index: List[np.ndarray]  # per pool: pool row -> row in `vectors` (-1 = not requested)
-    shared_rows: List[int]  # per pool: requested rows served by the reference pool's lists
-    own_rows: List[int]  # per pool: requested rows that needed a list of their own
-
-
-def matching_rows(
-    vectors: np.ndarray,
-    reference: np.ndarray,
-    num_groups: int,
-    size: int,
-    reference_size: int,
-    groups_per_step: int = 1024,
-) -> np.ndarray:
-    """For every row of a pool (``num_groups x size``): is it byte-for-byte the row with the
-    same member number in the same group of the reference pool (``reference_size`` members)?"""
-    dim = vectors.shape[1]
-    equal = np.empty(num_groups * size, dtype=bool)
-    for first in range(0, num_groups, groups_per_step):
-        last = min(first + groups_per_step, num_groups)
-        mine = vectors[first * size : last * size].reshape(last - first, size, dim)
-        theirs = reference[first * reference_size : last * reference_size].reshape(
-            last - first, reference_size, dim
-        )[:, :size, :]
-        equal[first * size : last * size] = (mine == theirs).all(axis=2).reshape(-1)
-    return equal
-
-
-def plan_list_requests(pools: Sequence[PoolRequests]) -> ListRequests:
-    """Decide which distinct vectors need a universe list and where each pool row finds it.
-
-    The largest N2 pool is the reference. A row of a smaller pool whose vector is exactly
-    the same as the matching row of the reference pool (same group, same member number)
-    uses the reference's list. Every other requested row gets a list of its own. Nothing
-    is assumed about how the pools were generated: equality is checked on the vectors, and
-    a row that differs merely costs one more list.
-    """
-    dim = pools[0].vectors.shape[1]
-    layouts = [pool.layout for pool in pools]
-    reference_position = None
-    for position, layout in enumerate(layouts):
-        if layout is not None and (
-            reference_position is None or layout[1] > layouts[reference_position][1]
-        ):
-            reference_position = position
-
-    # Rows (of the reference pool) and extra vectors that need lists.
-    reference_rows: List[np.ndarray] = []
-    own_rows: Dict[int, np.ndarray] = {}
-    served_by_reference: Dict[int, np.ndarray] = {}
-    reference_target: Dict[int, np.ndarray] = {}  # pool position -> reference row per requested row
-
-    for position, pool in enumerate(pools):
-        requested = pool.requested_rows
-        if position == reference_position or reference_position is None or pool.layout is None:
-            if position == reference_position:
-                reference_rows.append(requested)
-                served_by_reference[position] = np.ones(len(requested), dtype=bool)
-                reference_target[position] = requested
-            else:
-                served_by_reference[position] = np.zeros(len(requested), dtype=bool)
-            continue
-
-        groups, size = pool.layout
-        reference_pool = pools[reference_position]
-        _, reference_size = reference_pool.layout
-        same = matching_rows(pool.vectors, reference_pool.vectors, groups, size, reference_size)
-        matches = same[requested]
-        mapped = (requested // size) * reference_size + (requested % size)
-        served_by_reference[position] = matches
-        reference_target[position] = mapped
-        reference_rows.append(mapped[matches])
-
-    needed_reference = (
-        np.unique(np.concatenate(reference_rows)) if reference_rows else np.empty(0, np.int64)
-    )
-
-    vectors_parts: List[np.ndarray] = []
-    if reference_position is not None and len(needed_reference) > 0:
-        vectors_parts.append(pools[reference_position].vectors[needed_reference])
-    next_index = len(needed_reference)
-
-    list_index: List[np.ndarray] = []
-    shared_counts: List[int] = []
-    own_counts: List[int] = []
-    for position, pool in enumerate(pools):
-        index = np.full(len(pool.vectors), -1, dtype=np.int64)
-        requested = pool.requested_rows
-        served = served_by_reference[position]
-        if served.any():
-            targets = reference_target[position][served]
-            index[requested[served]] = np.searchsorted(needed_reference, targets)
-        unserved = requested[~served]
-        if len(unserved) > 0:
-            index[unserved] = next_index + np.arange(len(unserved))
-            vectors_parts.append(pool.vectors[unserved])
-            next_index += len(unserved)
-        list_index.append(index)
-        shared_counts.append(int(served.sum()))
-        own_counts.append(int(len(unserved)))
-
-    vectors = (
-        np.concatenate(vectors_parts, axis=0)
-        if vectors_parts
-        else np.empty((0, dim), dtype=pools[0].vectors.dtype)
-    )
-    return ListRequests(vectors, list_index, shared_counts, own_counts)
-
-
-# ---------------------------------------------------------------------------
 # the fallback: scan the active set
 # ---------------------------------------------------------------------------
 
@@ -567,3 +440,49 @@ class ActiveSetScanner:
             prefetch_blocks(blocks), queries, k, self._metric, self._plan.device,
             self._plan.query_chunk_rows,
         )
+
+
+class AnswerSource:
+    """Turns universe lists into ground truth, with the scan of the active set as fallback.
+
+    Used for the evaluation answers of a build and for the stream answers of the follow-up
+    stage (``stream_gt.py``): both read the answer of a request out of its universe list.
+    """
+
+    def __init__(
+        self, base_path: Path, insert_path: Optional[Path], num_base: int, metric: str,
+        plan: ParallelPlan,
+    ) -> None:
+        self._num_base = num_base
+        self._scanner = ActiveSetScanner(base_path, insert_path, metric, plan)
+
+    def close(self) -> None:
+        self._scanner.close()
+
+    def answer(
+        self,
+        list_ids: np.ndarray,
+        list_dists: np.ndarray,
+        query_vectors: Callable[[np.ndarray], np.ndarray],
+        k: int,
+        inserted: int,
+        deleted_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """Answers for the given list rows, and how many of them needed the fallback.
+
+        ``query_vectors(rows)`` yields the vectors of the rows that must be scanned because
+        their list had fewer than k live entries.
+        """
+        alive_limit = self._num_base + inserted
+        ids, dists, enough = select_alive_prefix(list_ids, list_dists, alive_limit, deleted_mask, k)
+        missing = np.flatnonzero(~enough)
+        if len(missing) > 0:
+            # Requests of the same step that repeat a vector are scanned only once.
+            unique_vectors, inverse = np.unique(
+                query_vectors(missing), axis=0, return_inverse=True
+            )
+            result = self._scanner.top(unique_vectors, k, inserted, deleted_mask)
+            inverse = inverse.reshape(-1)
+            ids[missing] = result.neighbour_ids[inverse]
+            dists[missing] = result.neighbour_dists[inverse]
+        return ids, dists, int(len(missing))
